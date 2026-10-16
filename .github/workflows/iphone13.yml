@@ -3,11 +3,6 @@ name: Build iPhone 13 Optimized IPA
 on:
   workflow_dispatch:
     inputs:
-      upstream_release_tag:
-        description: "基础包版本 Tag"
-        required: true
-        default: "v1.0.17-build.9.1"
-        type: string
       ipa_variant:
         description: "IPA 架构版本 (iPhone 13 必选 ios18)"
         required: true
@@ -24,99 +19,43 @@ jobs:
   build-unsigned-ipa:
     runs-on: macos-15
     steps:
-      - name: 1. Checkout & Clone Upstream Engine
-        run: |
-          git clone --depth 1 https://github.com/jhaizhou-ops/d2r-mobile.git d2r-mobile-src
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
 
-      - name: 2. Patch nvn_mtl.m (6 Universal iPhone 13 Optimizations)
-        run: |
-          python3 - << 'PYEOF'
-          import re
-          from pathlib import Path
-
-          nvn_mtl = Path("d2r-mobile-src/dm/gfx/nvn/nvn_mtl.m")
-          if nvn_mtl.exists():
-              content = nvn_mtl.read_text(encoding="utf-8")
-              helper_code = r"""
-          #include <sys/sysctl.h>
-          #include <sys/mman.h>
-          #include <mach/mach.h>
-          #ifndef MADV_FREE_REUSABLE
-          #define MADV_FREE_REUSABLE 9
-          #endif
-          static int dm_is_4gb_device(void) {
-              static int s_is_4gb = -1;
-              if (__builtin_expect(s_is_4gb < 0, 0)) {
-                  uint64_t mem = 0; size_t len = sizeof(mem);
-                  if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0 && mem > 0)
-                      s_is_4gb = (mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL + 512ULL * 1024ULL * 1024ULL)) ? 1 : 0;
-                  else s_is_4gb = 0;
-              }
-              return s_is_4gb;
-          }
-          static uint64_t dm_current_phys_footprint_mb(void) {
-              task_vm_info_data_t vm_info; mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-              if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &count) == KERN_SUCCESS)
-                  return (uint64_t)(vm_info.phys_footprint >> 20);
-              return 0;
-          }
-          static int dm_should_thermal_throttle(void) {
-              return ([[NSProcessInfo processInfo] thermalState] >= NSProcessInfoThermalStateFair) ? 1 : 0;
-          }
-          static void dm_reclaim_guest_tex_pages(const void *mem, uint64_t size) {
-              if (!mem || size < 16384) return;
-              if (!dm_is_4gb_device() && dm_current_phys_footprint_mb() < 1850) return;
-              uintptr_t pg = (uintptr_t)getpagesize();
-              uintptr_t lo = ((uintptr_t)mem + pg - 1) & ~(pg - 1);
-              uintptr_t hi = ((uintptr_t)mem + (uintptr_t)size) & ~(pg - 1);
-              if (hi > lo) madvise((void *)lo, (size_t)(hi - lo), MADV_FREE_REUSABLE);
-          }
-          """
-              content = re.sub(r"(static\s+void\s+res_commit\s*\(\s*void\s*\)\s*\{)", helper_code + "\n" + r"\1", content, count=1)
-              content = re.sub(
-                  r"(res_add\s*\(\s*mt\s*\)\s*;[^\n]*\n\s*nvn_dirty_protect\s*\(\s*t->mem\s*,\s*t->L\.size\s*\)\s*;)",
-                  r"res_add(mt);\n    dm_reclaim_guest_tex_pages(t->mem, t->L.size);\n    nvn_dirty_protect(t->mem, t->L.size);",
-                  content, count=1
-              )
-              content = re.sub(
-                  r"(d\.storageMode\s*=\s*MTLStorageModePrivate\s*;[^\n]*)",
-                  r"\1\n    if (@available(iOS 16.0, *)) { if (!fmt_compressed(t->d.format) && !packaged) d.compressionType = MTLTextureCompressionTypeLossless; }",
-                  content, count=1
-              )
-              content = re.sub(
-                  r"(static\s+CAFrameRateRange\s+link_range\s*\(\s*int\s+mode\s*\)\s*\{)",
-                  r"\1\n    if (dm_is_4gb_device() || dm_should_thermal_throttle()) return CAFrameRateRangeMake(30, 30, 30);",
-                  content, count=1
-              )
-              nvn_mtl.write_text(content, encoding="utf-8")
-          PYEOF
-
-      - name: 3. Download Base IPA from jiayx/d2r-mobile-build
+      - name: 2. Auto-Locate & Download Latest Base IPA
         env:
-          TAG: ${{ inputs.upstream_release_tag }}
           VARIANT: ${{ inputs.ipa_variant }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euxo pipefail
           mkdir -p base_ipa extracted_ipa outputs
-          if [ "$VARIANT" = "ios18" ]; then
-            IPA_NAME="D2RMobile-${TAG}-ios18.ipa"
-          else
-            IPA_NAME="D2RMobile-${TAG}.ipa"
-          fi
-          curl -fL --retry 3 -o "base_ipa/base.ipa" "https://github.com/jiayx/d2r-mobile-build/releases/download/${TAG}/${IPA_NAME}"
-          unzip -q "base_ipa/base.ipa" -d extracted_ipa
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/jiayx/d2r-mobile-build/releases?per_page=15" > base_ipa/releases.json
 
-      - name: 4. Build & Inject Universal iPhone 13 Optimizer into IPA
+          if [ "$VARIANT" = "ios18" ]; then
+            DOWNLOAD_URL=$(jq -r '[.[] | .assets[] | select(.name | endswith("-ios18.ipa")) | .browser_download_url][0]' base_ipa/releases.json)
+            TAG=$(jq -r '[.[] | select(any(.assets[]; .name | endswith("-ios18.ipa"))) | .tag_name][0]' base_ipa/releases.json)
+          else
+            DOWNLOAD_URL=$(jq -r '[.[] | .assets[] | select((.name | endswith(".ipa")) and (.name | endswith("-ios18.ipa") | not)) | .browser_download_url][0]' base_ipa/releases.json)
+            TAG=$(jq -r '[.[] | select(any(.assets[]; (.name | endswith(".ipa")) and (.name | endswith("-ios18.ipa") | not))) | .tag_name][0]' base_ipa/releases.json)
+          fi
+
+          echo "$TAG" > base_ipa/tag.txt
+          echo "Downloading Tag=$TAG from $DOWNLOAD_URL"
+          curl -fL --retry 3 -o "base_ipa/base.ipa" "$DOWNLOAD_URL"
+          unzip -q "base_ipa/base.ipa" -d extracted_ipa
+          ls -la extracted_ipa/Payload/
+
+      - name: 3. Compile & Inject Universal iPhone 13 (A15 / 4GB) Engine Optimizer
         env:
-          TAG: ${{ inputs.upstream_release_tag }}
           VARIANT: ${{ inputs.ipa_variant }}
         run: |
-          brew install ldid || true
+          set -euxo pipefail
           APP_DIR=$(find extracted_ipa/Payload -maxdepth 1 -name "*.app" | head -n 1)
           EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_DIR/Info.plist")
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
 
-          # 编译通用低内存与 A15 温控护航模块 (Method Swizzling + Mach VM 脏页定期回收守护线程)
-          cat << 'OBJCEOF' > iphone13_universal_opt.m
+          cat << 'EOF' > iphone13_universal_opt.m
           #import <Foundation/Foundation.h>
           #import <Metal/Metal.h>
           #import <QuartzCore/QuartzCore.h>
@@ -124,39 +63,92 @@ jobs:
           #include <sys/sysctl.h>
           #include <sys/mman.h>
           #include <mach/mach.h>
+          #include <malloc/malloc.h>
           #include <pthread.h>
+          #include <unistd.h>
+
+          #ifndef MADV_FREE_REUSABLE
+          #define MADV_FREE_REUSABLE 9
+          #endif
+
+          extern kern_return_t vm_region_64(
+              vm_map_read_t target_task,
+              vm_address_t *address,
+              vm_size_t *size,
+              vm_region_flavor_t flavor,
+              vm_region_info_t info,
+              mach_msg_type_number_t *infoCnt,
+              mach_port_t *object_name
+          );
 
           static int is_4gb_device(void) {
               static int s = -1;
               if (s < 0) {
-                  uint64_t m = 0; size_t l = sizeof(m);
-                  sysctlbyname("hw.memsize", &m, &l, NULL, 0);
-                  s = (m > 0 && m <= (4ULL << 30) + (512ULL << 20)) ? 1 : 0;
+                  uint64_t m = 0;
+                  size_t l = sizeof(m);
+                  if (sysctlbyname("hw.memsize", &m, &l, NULL, 0) == 0 && m > 0) {
+                      s = (m <= (4ULL << 30) + (512ULL << 20)) ? 1 : 0;
+                  } else {
+                      s = 1;
+                  }
               }
               return s;
           }
 
           static uint64_t phys_footprint_mb(void) {
-              task_vm_info_data_t vi; mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
-              if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &c) == KERN_SUCCESS)
+              task_vm_info_data_t vi;
+              mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+              if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &c) == KERN_SUCCESS) {
                   return (uint64_t)(vi.phys_footprint >> 20);
+              }
               return 0;
           }
 
-          static void (*orig_setPreferredFrameRateRange)(id, SEL, CAFrameRateRange);
-          static void swizzled_setPreferredFrameRateRange(id self, SEL _cmd, CAFrameRateRange range) {
+          // 扫描已上传至 GPU Private 且被 nvn_dirty_protect 锁为只读 (VM_PROT_READ) 的大块贴图池页并归还物理脏页
+          static void reclaim_readonly_tex_pool_pages(void) {
+              vm_address_t addr = 0x100000000ULL;
+              while (addr < 0x700000000ULL) {
+                  vm_size_t size = 0;
+                  vm_region_basic_info_data_64_t info;
+                  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+                  mach_port_t obj_name = MACH_PORT_NULL;
+                  kern_return_t kr = vm_region_64(
+                      mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                      (vm_region_info_t)&info, &count, &obj_name
+                  );
+                  if (kr != KERN_SUCCESS || size == 0) break;
+                  if (info.protection == VM_PROT_READ && (info.max_protection & VM_PROT_WRITE) && size >= (256 * 1024)) {
+                      madvise((void *)addr, (size_t)size, MADV_FREE_REUSABLE);
+                  }
+                  addr += size;
+              }
+          }
+
+          static void (*orig_metal_setRange)(id, SEL, CAFrameRateRange);
+          static void swizzled_metal_setRange(id self, SEL _cmd, CAFrameRateRange range) {
               NSProcessInfoThermalState st = [[NSProcessInfo processInfo] thermalState];
               if (is_4gb_device() || st >= NSProcessInfoThermalStateFair) {
                   range = CAFrameRateRangeMake(30, 30, 30);
               }
-              if (orig_setPreferredFrameRateRange) orig_setPreferredFrameRateRange(self, _cmd, range);
+              if (orig_metal_setRange) orig_metal_setRange(self, _cmd, range);
+          }
+
+          static void (*orig_ca_setRange)(id, SEL, CAFrameRateRange);
+          static void swizzled_ca_setRange(id self, SEL _cmd, CAFrameRateRange range) {
+              NSProcessInfoThermalState st = [[NSProcessInfo processInfo] thermalState];
+              if (is_4gb_device() || st >= NSProcessInfoThermalStateFair) {
+                  range = CAFrameRateRangeMake(30, 30, 30);
+              }
+              if (orig_ca_setRange) orig_ca_setRange(self, _cmd, range);
           }
 
           static void *jetsam_guard_thread(void *arg) {
               (void)arg;
               while (1) {
-                  usleep(1500000);
-                  if (phys_footprint_mb() > 1800) {
+                  sleep(2);
+                  uint64_t mb = phys_footprint_mb();
+                  if (mb > 1400) {
+                      reclaim_readonly_tex_pool_pages();
                       malloc_zone_pressure_relief(NULL, 0);
                   }
               }
@@ -165,60 +157,143 @@ jobs:
 
           __attribute__((constructor))
           static void init_iphone13_universal_opt(void) {
-              setenv("DM_LOW_MEM", "1", 1);
-              Class cls = NSClassFromString(@"CAMetalDisplayLink");
-              if (cls) {
-                  Method m = class_getInstanceMethod(cls, @selector(setPreferredFrameRateRange:));
-                  if (m) orig_setPreferredFrameRateRange = (void *)method_setImplementation(m, (IMP)swizzled_setPreferredFrameRateRange);
+              setenv("DM_FORCE_LOW_MEM", "1", 1);
+              Class mtlLinkCls = NSClassFromString(@"CAMetalDisplayLink");
+              if (mtlLinkCls) {
+                  Method m = class_getInstanceMethod(mtlLinkCls, @selector(setPreferredFrameRateRange:));
+                  if (m) orig_metal_setRange = (void *)method_setImplementation(m, (IMP)swizzled_metal_setRange);
+              }
+              Class caLinkCls = NSClassFromString(@"CADisplayLink");
+              if (caLinkCls) {
+                  Method m = class_getInstanceMethod(caLinkCls, @selector(setPreferredFrameRateRange:));
+                  if (m) orig_ca_setRange = (void *)method_setImplementation(m, (IMP)swizzled_ca_setRange);
               }
               pthread_t th;
               pthread_create(&th, NULL, jetsam_guard_thread, NULL);
               pthread_detach(th);
           }
-          OBJCEOF
+          EOF
 
-          clang -dynamiclib -arch arm64 -isysroot "$SDK_PATH" -miphoneos-version-min=18.0 -O3 \
+          clang -dynamiclib -arch arm64 -isysroot "$SDK_PATH" -miphoneos-version-min=18.0 -O2 \
             -framework Foundation -framework Metal -framework QuartzCore \
             -install_name "@executable_path/libiphone13_opt.dylib" \
             iphone13_universal_opt.m -o "$APP_DIR/libiphone13_opt.dylib"
 
-          # 将动态库写入主程序 Load Commands 或通过重编二进制注入
-          python3 - "$APP_DIR/$EXEC_NAME" << 'PATCH_MACHO'
-          import struct, sys
-          path = sys.argv[1]
-          data = bytearray(open(path, "rb").read())
-          magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from("<IIIIIIII", data, 0)
-          dylib_name = b"@executable_path/libiphone13_opt.dylib\x00"
-          cmd_size = (24 + len(dylib_name) + 7) & ~7
-          lc_load_dylib = struct.pack("<IIIIII", 0x0c, cmd_size, 24, 0, 0x10000, 0x10000) + dylib_name.ljust(cmd_size - 24, b"\x00")
-          cmd_end = 32 + sizeofcmds
-          if all(b == 0 for b in data[cmd_end:cmd_end + cmd_size]):
-              data[cmd_end:cmd_end + cmd_size] = lc_load_dylib
-              struct.pack_into("<II", data, 16, ncmds + 1, sizeofcmds + cmd_size)
-              open(path, "wb").write(data)
-              print("[SUCCESS] Injected LC_LOAD_DYLIB into Mach-O header")
-          PATCH_MACHO
+          cat << 'EOF' > inject_dylib.c
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          #include <string.h>
 
-          ENTITLEMENTS="d2r-mobile-src/dm/ios/Sources/DmIOS.entitlements"
-          codesign --force --sign - --timestamp=none "$APP_DIR/libiphone13_opt.dylib"
-          if [ -f "$ENTITLEMENTS" ]; then
-            codesign --force --sign - --entitlements "$ENTITLEMENTS" --timestamp=none "$APP_DIR" || \
-            ldid -S"$ENTITLEMENTS" "$APP_DIR/$EXEC_NAME"
-          fi
+          struct mach_header_64 {
+              uint32_t magic; int32_t cputype; int32_t cpusubtype; uint32_t filetype;
+              uint32_t ncmds; uint32_t sizeofcmds; uint32_t flags; uint32_t reserved;
+          };
+          struct load_command { uint32_t cmd; uint32_t cmdsize; };
+          struct dylib_command {
+              uint32_t cmd; uint32_t cmdsize; uint32_t name_offset;
+              uint32_t timestamp; uint32_t current_version; uint32_t compatibility_version;
+          };
 
+          int main(int argc, char **argv) {
+              if (argc < 3) return 1;
+              FILE *f = fopen(argv[1], "rb");
+              if (!f) return 1;
+              fseek(f, 0, SEEK_END);
+              long fsize = ftell(f);
+              fseek(f, 0, SEEK_SET);
+              uint8_t *buf = (uint8_t *)malloc(fsize);
+              if (!buf || fread(buf, 1, fsize, f) != (size_t)fsize) return 1;
+              fclose(f);
+
+              struct mach_header_64 *mh = (struct mach_header_64 *)buf;
+              if (mh->magic != 0xfeedfacf) return 1;
+
+              size_t name_len = strlen(argv[2]) + 1;
+              uint32_t cmd_size = (uint32_t)((sizeof(struct dylib_command) + name_len + 7) & ~7);
+              uint8_t new_cmd[256];
+              memset(new_cmd, 0, sizeof(new_cmd));
+              struct dylib_command *dc = (struct dylib_command *)new_cmd;
+              dc->cmd = 0x80000018;
+              dc->cmdsize = cmd_size;
+              dc->name_offset = sizeof(struct dylib_command);
+              dc->timestamp = 2;
+              dc->current_version = 0x10000;
+              dc->compatibility_version = 0x10000;
+              memcpy(new_cmd + sizeof(struct dylib_command), argv[2], name_len);
+
+              uint32_t offset = sizeof(struct mach_header_64);
+              uint32_t last_off = offset, last_cmd = 0, last_sz = 0;
+              for (uint32_t i = 0; i < mh->ncmds; i++) {
+                  struct load_command *lc = (struct load_command *)(buf + offset);
+                  last_off = offset; last_cmd = lc->cmd; last_sz = lc->cmdsize;
+                  offset += lc->cmdsize;
+              }
+              if (last_cmd == 0x1d) {
+                  uint8_t sig_copy[64];
+                  memcpy(sig_copy, buf + last_off, last_sz);
+                  memcpy(buf + last_off, new_cmd, cmd_size);
+                  memcpy(buf + last_off + cmd_size, sig_copy, last_sz);
+              } else {
+                  memcpy(buf + offset, new_cmd, cmd_size);
+              }
+              mh->ncmds += 1;
+              mh->sizeofcmds += cmd_size;
+
+              f = fopen(argv[1], "wb");
+              if (!f) return 1;
+              fwrite(buf, 1, fsize, f);
+              fclose(f);
+              printf("Injected %s into %s\n", argv[2], argv[1]);
+              return 0;
+          }
+          EOF
+
+          clang -O2 inject_dylib.c -o inject_dylib
+          /usr/bin/codesign --remove-signature "$APP_DIR/$EXEC_NAME" || true
+          ./inject_dylib "$APP_DIR/$EXEC_NAME" "@executable_path/libiphone13_opt.dylib"
+          chmod +x "$APP_DIR/$EXEC_NAME" "$APP_DIR/libiphone13_opt.dylib"
+
+          cat << 'EOF' > DmIOS.entitlements
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.developer.kernel.increased-memory-limit</key>
+              <true/>
+              <key>com.apple.developer.kernel.extended-virtual-addressing</key>
+              <true/>
+              <key>com.apple.developer.sustained-execution</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          /usr/bin/codesign --force --sign - --timestamp=none "$APP_DIR/libiphone13_opt.dylib"
+          /usr/bin/codesign --force --sign - --entitlements DmIOS.entitlements --timestamp=none "$APP_DIR"
+
+          TAG=$(cat base_ipa/tag.txt)
           OUT_IPA="outputs/D2RMobile-${TAG}-iPhone13-Universal-${VARIANT}-unsigned.ipa"
           cd extracted_ipa
           zip -qry "../$OUT_IPA" Payload
           cd ..
           ls -lh "$OUT_IPA"
 
+      - name: 4. Upload Unsigned IPA to Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: D2RMobile-iPhone13-Unsigned-IPA
+          path: outputs/*.ipa
+          if-no-files-found: error
+
       - name: 5. Publish Unsigned IPA to GitHub Releases
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.upstream_release_tag }}
           VARIANT: ${{ inputs.ipa_variant }}
         run: |
+          TAG=$(cat base_ipa/tag.txt)
           REL_TAG="iphone13-opt-${TAG}-${VARIANT}-$(date +%Y%m%d%H%M)"
           gh release create "$REL_TAG" outputs/*.ipa \
-            --title "D2R Mobile (${TAG}) — iPhone 13 根源优化待签名版" \
+            --repo "${{ github.repository }}" \
+            --title "D2R Mobile (${TAG}) — iPhone 13 (A15 / 4GB) 根源优化待签名版" \
             --notes "专为 iPhone 13 (iOS 27 / A15 / 4GB RAM) 构建的待签名 IPA，已注入扩展内存权限、Mach 脏页水位守护与 30Hz 闭环温控锁帧。"
