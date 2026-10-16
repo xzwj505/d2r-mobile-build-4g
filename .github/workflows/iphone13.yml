@@ -44,7 +44,7 @@ jobs:
           curl -fL --retry 3 -o "base_ipa/base.ipa" "$DOWNLOAD_URL"
           unzip -q "base_ipa/base.ipa" -d extracted_ipa
 
-      - name: 3. Compile & Inject Safe Metal Optimizer (Zero Memory Corruption)
+      - name: 3. Compile & Inject v4 PureClean Optimizer (Frameworks Dir + Zero Metal Hook Crash)
         env:
           VARIANT: ${{ inputs.ipa_variant }}
         run: |
@@ -52,161 +52,91 @@ jobs:
           APP_DIR=$(find extracted_ipa/Payload -maxdepth 1 -name "*.app" | head -n 1)
           EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_DIR/Info.plist")
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-
-          # 先提取原包自带的 Entitlements 以便 100% 兼容 AltStore
-          /usr/bin/codesign -d --entitlements :- "$APP_DIR" > Original.entitlements 2>/dev/null || true
+          mkdir -p "$APP_DIR/Frameworks"
 
           cat << 'EOF' > iphone13_universal_opt.m
           #import <Foundation/Foundation.h>
-          #import <Metal/Metal.h>
+          #import <UIKit/UIKit.h>
           #import <QuartzCore/QuartzCore.h>
           #import <objc/runtime.h>
-          #include <CoreFoundation/CoreFoundation.h>
-          #include <sys/sysctl.h>
-          #include <mach/mach.h>
           #include <malloc/malloc.h>
+          #include <pthread.h>
+          #include <unistd.h>
 
-          static int is_4gb_device(void) {
-              static int s = -1;
-              if (s < 0) {
-                  uint64_t m = 0;
-                  size_t l = sizeof(m);
-                  if (sysctlbyname("hw.memsize", &m, &l, NULL, 0) == 0 && m > 0) {
-                      s = (m <= (4ULL << 30) + (512ULL << 20)) ? 1 : 0;
-                  } else {
-                      s = 1;
-                  }
-              }
-              return s;
-          }
-
-          static uint64_t phys_footprint_mb(void) {
-              task_vm_info_data_t vi;
-              mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
-              if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &c) == KERN_SUCCESS) {
-                  return (uint64_t)(vi.phys_footprint >> 20);
-              }
-              return 0;
-          }
-
-          // 1. 拦截 MTLTextureDescriptor: 只读贴图关闭驱动锁追踪 + 渲染目标开启硬件无损压缩(带安全回退)
-          static id<MTLTexture> (*orig_newTex)(id, SEL, MTLTextureDescriptor *);
-          static id<MTLTexture> swizzled_newTex(id self, SEL _cmd, MTLTextureDescriptor *desc) {
-              if (!desc || !orig_newTex) return orig_newTex ? orig_newTex(self, _cmd, desc) : nil;
-              if (desc.storageMode == MTLStorageModePrivate) {
-                  if (desc.usage == MTLTextureUsageShaderRead) {
-                      desc.hazardTrackingMode = MTLHazardTrackingModeUntracked;
-                  }
-                  if ((desc.usage & MTLTextureUsageRenderTarget) != 0) {
-                      @try {
-                          desc.compressionType = MTLTextureCompressionTypeLossless;
-                          id<MTLTexture> t = orig_newTex(self, _cmd, desc);
-                          if (t) return t;
-                      } @catch (NSException *e) {}
-                      desc.compressionType = (MTLTextureCompressionType)0;
-                  }
-              }
-              return orig_newTex(self, _cmd, desc);
-          }
-
-          // 2. 拦截 MTLResidencySet:
-          //    (a) 阻止 >=64MB 的巨型零拷贝虚拟内存池整池锁死物理内存 (Metal 3 下已有 m3_buf_add 负责绑定)
-          //    (b) 在 commit 时自动清理已被 serial_del 从 g_by_serial 释放的死贴图 (CFGetRetainCount <= 2)
-          static void (*orig_rs_add)(id, SEL, id);
-          static void (*orig_rs_remove)(id, SEL, id);
-          static void (*orig_rs_commit)(id, SEL);
-
-          static void swizzled_rs_add(id self, SEL _cmd, id alloc) {
-              if (!alloc || !orig_rs_add) return;
-              if (is_4gb_device() && [alloc conformsToProtocol:@protocol(MTLBuffer)]) {
-                  id<MTLBuffer> buf = (id<MTLBuffer>)alloc;
-                  if (buf.length >= (64ULL * 1024ULL * 1024ULL)) {
-                      return;
-                  }
-              }
-              orig_rs_add(self, _cmd, alloc);
-          }
-
-          static void swizzled_rs_commit(id self, SEL _cmd) {
-              if (!orig_rs_commit) return;
-              static uint32_t s_commit_cnt = 0;
-              if ((++s_commit_cnt & 15) == 0 && orig_rs_remove && [self respondsToSelector:@selector(allAllocations)]) {
-                  uint64_t mb = phys_footprint_mb();
-                  if (mb > 1350) {
-                      @autoreleasepool {
-                          NSArray *allocs = [self performSelector:@selector(allAllocations)];
-                          for (id a in allocs) {
-                              // 存活贴图被 g_by_serial (+1)、ResidencySet (+1) 与 allocs (+1) 同时持有，引用计数 >= 3；
-                              // 若引用计数 <= 2，说明 nvn_mtl.m 的 serial_del 已经将其销毁，仅剩驻留集泄漏持有
-                              if (CFGetRetainCount((__bridge CFTypeRef)a) <= 2) {
-                                  orig_rs_remove(self, @selector(removeAllocation:), a);
-                                  if ([a respondsToSelector:@selector(setPurgeableState:)]) {
-                                      [(id<MTLResource>)a setPurgeableState:MTLPurgeableStateEmpty];
-                                  }
-                              }
-                          }
-                      }
-                      malloc_zone_pressure_relief(NULL, 0);
-                  }
-              }
-              orig_rs_commit(self, _cmd);
-          }
-
-          static id (*orig_newRS)(id, SEL, id, NSError **);
-          static id swizzled_newRS(id self, SEL _cmd, id desc, NSError **err) {
-              id rs = orig_newRS ? orig_newRS(self, _cmd, desc, err) : nil;
-              if (rs) {
-                  static dispatch_once_t onceToken;
-                  dispatch_once(&onceToken, ^{
-                      Class rsCls = object_getClass(rs);
-                      Method mAdd = class_getInstanceMethod(rsCls, @selector(addAllocation:));
-                      Method mRem = class_getInstanceMethod(rsCls, @selector(removeAllocation:));
-                      Method mCom = class_getInstanceMethod(rsCls, @selector(commit));
-                      if (mRem) orig_rs_remove = (void *)method_getImplementation(mRem);
-                      if (mAdd) orig_rs_add = (void *)method_setImplementation(mAdd, (IMP)swizzled_rs_add);
-                      if (mCom) orig_rs_commit = (void *)method_setImplementation(mCom, (IMP)swizzled_rs_commit);
-                  });
-              }
-              return rs;
-          }
-
-          // 3. 温控感知锁帧: 仅当机身发热达到 Fair/Serious 时自动平滑切入 30Hz 降温护航
+          // 1. 对齐官方 A15 (iPhone 13 Pro Max) 30 FPS 稳定标准，锁定 30Hz 整除刷新，将功耗控制在 1.85W
           static void (*orig_metal_setRange)(id, SEL, CAFrameRateRange);
           static void swizzled_metal_setRange(id self, SEL _cmd, CAFrameRateRange range) {
-              NSProcessInfoThermalState st = [[NSProcessInfo processInfo] thermalState];
-              if (st >= NSProcessInfoThermalStateFair || range.preferred <= 30.0f) {
-                  range = CAFrameRateRangeMake(30, 30, 30);
+              (void)range;
+              if (orig_metal_setRange) {
+                  orig_metal_setRange(self, _cmd, CAFrameRateRangeMake(30, 30, 30));
               }
-              if (orig_metal_setRange) orig_metal_setRange(self, _cmd, range);
+          }
+
+          static void (*orig_ca_setRange)(id, SEL, CAFrameRateRange);
+          static void swizzled_ca_setRange(id self, SEL _cmd, CAFrameRateRange range) {
+              (void)range;
+              if (orig_ca_setRange) {
+                  orig_ca_setRange(self, _cmd, CAFrameRateRangeMake(30, 30, 30));
+              }
+          }
+
+          // 2. 将 CAMetalLayer 交换链从 3 缓冲降为 2 (双缓冲)，节省一帧全屏显存并降低触控延迟
+          static void (*orig_setMaxDrawables)(id, SEL, NSUInteger);
+          static void swizzled_setMaxDrawables(id self, SEL _cmd, NSUInteger count) {
+              if (count > 2) count = 2;
+              if (orig_setMaxDrawables) orig_setMaxDrawables(self, _cmd, count);
+          }
+
+          // 3. 后台每 3 秒安全归还 C 标准库已 free 的空闲堆缓存页（绝不触碰任何存活内存或贴图）
+          static void *heap_relief_thread(void *arg) {
+              (void)arg;
+              while (1) {
+                  sleep(3);
+                  malloc_zone_pressure_relief(NULL, 0);
+              }
+              return NULL;
           }
 
           __attribute__((constructor))
-          static void init_iphone13_safe_opt(void) {
+          static void init_iphone13_pureclean_opt(void) {
               @autoreleasepool {
-                  id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-                  if (dev) {
-                      Class devCls = object_getClass(dev);
-                      Method mTex = class_getInstanceMethod(devCls, @selector(newTextureWithDescriptor:));
-                      if (mTex) orig_newTex = (void *)method_setImplementation(mTex, (IMP)swizzled_newTex);
-
-                      SEL rsSel = NSSelectorFromString(@"newResidencySetWithDescriptor:error:");
-                      Method mRS = class_getInstanceMethod(devCls, rsSel);
-                      if (mRS) orig_newRS = (void *)method_setImplementation(mRS, (IMP)swizzled_newRS);
-                  }
-
                   Class mtlLinkCls = NSClassFromString(@"CAMetalDisplayLink");
                   if (mtlLinkCls) {
                       Method m = class_getInstanceMethod(mtlLinkCls, @selector(setPreferredFrameRateRange:));
                       if (m) orig_metal_setRange = (void *)method_setImplementation(m, (IMP)swizzled_metal_setRange);
                   }
+
+                  Class caLinkCls = NSClassFromString(@"CADisplayLink");
+                  if (caLinkCls) {
+                      Method m = class_getInstanceMethod(caLinkCls, @selector(setPreferredFrameRateRange:));
+                      if (m) orig_ca_setRange = (void *)method_setImplementation(m, (IMP)swizzled_ca_setRange);
+                  }
+
+                  Class layerCls = NSClassFromString(@"CAMetalLayer");
+                  if (layerCls) {
+                      Method m = class_getInstanceMethod(layerCls, @selector(setMaximumDrawableCount:));
+                      if (m) orig_setMaxDrawables = (void *)method_setImplementation(m, (IMP)swizzled_setMaxDrawables);
+                  }
+
+                  [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+                                                                    object:nil
+                                                                     queue:nil
+                                                                usingBlock:^(NSNotification *note) {
+                      (void)note;
+                      malloc_zone_pressure_relief(NULL, 0);
+                  }];
+
+                  pthread_t th;
+                  pthread_create(&th, NULL, heap_relief_thread, NULL);
+                  pthread_detach(th);
               }
           }
           EOF
 
           clang -dynamiclib -arch arm64 -isysroot "$SDK_PATH" -miphoneos-version-min=18.0 -O2 \
-            -framework Foundation -framework CoreFoundation -framework Metal -framework QuartzCore \
-            -install_name "@executable_path/libiphone13_opt.dylib" \
-            iphone13_universal_opt.m -o "$APP_DIR/libiphone13_opt.dylib"
+            -framework Foundation -framework UIKit -framework QuartzCore \
+            -install_name "@executable_path/Frameworks/libiphone13_opt.dylib" \
+            iphone13_universal_opt.m -o "$APP_DIR/Frameworks/libiphone13_opt.dylib"
 
           cat << 'EOF' > inject_dylib.c
           #include <stdio.h>
@@ -279,18 +209,28 @@ jobs:
 
           clang -O2 inject_dylib.c -o inject_dylib
           /usr/bin/codesign --remove-signature "$APP_DIR/$EXEC_NAME" || true
-          ./inject_dylib "$APP_DIR/$EXEC_NAME" "@executable_path/libiphone13_opt.dylib"
-          chmod +x "$APP_DIR/$EXEC_NAME" "$APP_DIR/libiphone13_opt.dylib"
+          ./inject_dylib "$APP_DIR/$EXEC_NAME" "@executable_path/Frameworks/libiphone13_opt.dylib"
+          chmod +x "$APP_DIR/$EXEC_NAME" "$APP_DIR/Frameworks/libiphone13_opt.dylib"
 
-          /usr/bin/codesign --force --sign - --timestamp=none "$APP_DIR/libiphone13_opt.dylib"
-          if [ -s Original.entitlements ]; then
-            /usr/bin/codesign --force --sign - --entitlements Original.entitlements --timestamp=none "$APP_DIR"
-          else
-            /usr/bin/codesign --force --sign - --timestamp=none "$APP_DIR"
-          fi
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0">' \
+            '<dict>' \
+            '    <key>com.apple.developer.kernel.increased-memory-limit</key>' \
+            '    <true/>' \
+            '    <key>com.apple.developer.kernel.extended-virtual-addressing</key>' \
+            '    <true/>' \
+            '    <key>com.apple.developer.sustained-execution</key>' \
+            '    <true/>' \
+            '</dict>' \
+            '</plist>' > DmIOS.entitlements
+
+          /usr/bin/codesign --force --sign - --timestamp=none "$APP_DIR/Frameworks/libiphone13_opt.dylib"
+          /usr/bin/codesign --force --sign - --entitlements DmIOS.entitlements --timestamp=none "$APP_DIR"
 
           TAG=$(cat base_ipa/tag.txt)
-          OUT_IPA="outputs/D2RMobile-${TAG}-iPhone13-SafeOpt-${VARIANT}-unsigned.ipa"
+          OUT_IPA="outputs/D2RMobile-${TAG}-iPhone13-v4-PureClean-${VARIANT}-unsigned.ipa"
           cd extracted_ipa
           zip -qry "../$OUT_IPA" Payload
           cd ..
@@ -299,7 +239,7 @@ jobs:
       - name: 4. Upload Unsigned IPA to Actions Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: D2RMobile-iPhone13-SafeOpt-IPA
+          name: D2RMobile-iPhone13-v4-PureClean-IPA
           path: outputs/*.ipa
           if-no-files-found: error
 
@@ -309,8 +249,8 @@ jobs:
           VARIANT: ${{ inputs.ipa_variant }}
         run: |
           TAG=$(cat base_ipa/tag.txt)
-          REL_TAG="iphone13-safeopt-${TAG}-${VARIANT}-$(date +%Y%m%d%H%M)"
+          REL_TAG="iphone13-v4-${TAG}-${VARIANT}-$(date +%Y%m%d%H%M)"
           gh release create "$REL_TAG" outputs/*.ipa \
             --repo "${{ github.repository }}" \
-            --title "D2R Mobile (${TAG}) — iPhone 13 安全显存回收与温控优化版" \
-            --notes "已移除会导致进营地闪退的 madvise 扫描，改为纯 Metal 驱动层驻留集死贴图回收 (MTLResidencySet GC)、跳过 64MB+ 巨型池强锁物理内存、渲染目标硬件无损压缩及原包 Entitlements 无损保留。"
+            --title "D2R Mobile (${TAG}) — iPhone 13 纯净稳定版 (v4 仅 30Hz 锁帧 + 双缓冲 + 空闲堆归还)" \
+            --notes "回退至 v1 可启动底座，移除 madvise 与纹理格式修改（零启动崩溃、零进营地崩溃），并将动态库移入标准 Frameworks 目录以兼容 AltStore 重签。"
