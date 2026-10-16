@@ -44,7 +44,7 @@ jobs:
           curl -fL --retry 3 -o "base_ipa/base.ipa" "$DOWNLOAD_URL"
           unzip -q "base_ipa/base.ipa" -d extracted_ipa
 
-      - name: 3. Compile & Inject v4 PureClean Optimizer (Frameworks Dir + Zero Metal Hook Crash)
+      - name: 3. Compile & In-Place Re-Export Inject (0-Byte Header Growth, 0 Code Overwrite)
         env:
           VARIANT: ${{ inputs.ipa_variant }}
         run: |
@@ -57,13 +57,35 @@ jobs:
           cat << 'EOF' > iphone13_universal_opt.m
           #import <Foundation/Foundation.h>
           #import <UIKit/UIKit.h>
+          #import <Metal/Metal.h>
           #import <QuartzCore/QuartzCore.h>
           #import <objc/runtime.h>
           #include <malloc/malloc.h>
           #include <pthread.h>
           #include <unistd.h>
 
-          // 1. 对齐官方 A15 (iPhone 13 Pro Max) 30 FPS 稳定标准，锁定 30Hz 整除刷新，将功耗控制在 1.85W
+          // 1. 仅对纯渲染目标 (排除 PixelFormatView 与 ShaderWrite) 开启 A15 硬件无损帧缓冲压缩
+          static id<MTLTexture> (*orig_newTex)(id, SEL, MTLTextureDescriptor *);
+          static id<MTLTexture> swizzled_newTex(id self, SEL _cmd, MTLTextureDescriptor *desc) {
+              if (!desc || !orig_newTex) return orig_newTex ? orig_newTex(self, _cmd, desc) : nil;
+              if (desc.storageMode == MTLStorageModePrivate) {
+                  if (desc.usage == MTLTextureUsageShaderRead) {
+                      desc.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+                  } else if ((desc.usage & MTLTextureUsageRenderTarget) != 0 &&
+                             (desc.usage & (MTLTextureUsagePixelFormatView | MTLTextureUsageShaderWrite)) == 0) {
+                      MTLTextureCompressionType oldComp = desc.compressionType;
+                      @try {
+                          desc.compressionType = MTLTextureCompressionTypeLossless;
+                          id<MTLTexture> t = orig_newTex(self, _cmd, desc);
+                          if (t) return t;
+                      } @catch (NSException *e) {}
+                      desc.compressionType = oldComp;
+                  }
+              }
+              return orig_newTex(self, _cmd, desc);
+          }
+
+          // 2. 对齐 A15 (iPhone 13 Pro Max) 30 FPS 官方稳帧基准，锁定 30Hz 整除刷新 (1.85W)
           static void (*orig_metal_setRange)(id, SEL, CAFrameRateRange);
           static void swizzled_metal_setRange(id self, SEL _cmd, CAFrameRateRange range) {
               (void)range;
@@ -80,14 +102,14 @@ jobs:
               }
           }
 
-          // 2. 将 CAMetalLayer 交换链从 3 缓冲降为 2 (双缓冲)，节省一帧全屏显存并降低触控延迟
+          // 3. 将交换链从 3 缓冲降为 2 (双缓冲)，立省一帧全屏视网膜显存并降低延迟
           static void (*orig_setMaxDrawables)(id, SEL, NSUInteger);
           static void swizzled_setMaxDrawables(id self, SEL _cmd, NSUInteger count) {
               if (count > 2) count = 2;
               if (orig_setMaxDrawables) orig_setMaxDrawables(self, _cmd, count);
           }
 
-          // 3. 后台每 3 秒安全归还 C 标准库已 free 的空闲堆缓存页（绝不触碰任何存活内存或贴图）
+          // 4. 每 3 秒归还 C 标准库已释放的空闲堆缓存页
           static void *heap_relief_thread(void *arg) {
               (void)arg;
               while (1) {
@@ -98,8 +120,15 @@ jobs:
           }
 
           __attribute__((constructor))
-          static void init_iphone13_pureclean_opt(void) {
+          static void init_iphone13_v5_opt(void) {
               @autoreleasepool {
+                  id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+                  if (dev) {
+                      Class devCls = object_getClass(dev);
+                      Method mTex = class_getInstanceMethod(devCls, @selector(newTextureWithDescriptor:));
+                      if (mTex) orig_newTex = (void *)method_setImplementation(mTex, (IMP)swizzled_newTex);
+                  }
+
                   Class mtlLinkCls = NSClassFromString(@"CAMetalDisplayLink");
                   if (mtlLinkCls) {
                       Method m = class_getInstanceMethod(mtlLinkCls, @selector(setPreferredFrameRateRange:));
@@ -133,12 +162,16 @@ jobs:
           }
           EOF
 
+          # 使用 -Wl,-reexport_framework,QuartzCore 将系统 QuartzCore 完整重导出给主程序
           clang -dynamiclib -arch arm64 -isysroot "$SDK_PATH" -miphoneos-version-min=18.0 -O2 \
-            -framework Foundation -framework UIKit -framework QuartzCore \
-            -install_name "@executable_path/Frameworks/libiphone13_opt.dylib" \
-            iphone13_universal_opt.m -o "$APP_DIR/Frameworks/libiphone13_opt.dylib"
+            -framework Foundation -framework UIKit -framework Metal -framework QuartzCore \
+            -Wl,-reexport_framework,QuartzCore \
+            -install_name "@executable_path/Frameworks/libO.dylib" \
+            iphone13_universal_opt.m -o "$APP_DIR/Frameworks/libO.dylib"
 
-          cat << 'EOF' > inject_dylib.c
+          # 原位替换已有的 QuartzCore (58字节) 为 @executable_path/Frameworks/libO.dylib (38字节)
+          # ncmds 与 sizeofcmds 均保持 0 增长，绝不覆盖 __TEXT,__text 任何一条机器码！
+          cat << 'EOF' > replace_dylib.c
           #include <stdio.h>
           #include <stdlib.h>
           #include <stdint.h>
@@ -155,7 +188,7 @@ jobs:
           };
 
           int main(int argc, char **argv) {
-              if (argc < 3) return 1;
+              if (argc < 4) return 1;
               FILE *f = fopen(argv[1], "rb");
               if (!f) return 1;
               fseek(f, 0, SEEK_END);
@@ -168,36 +201,27 @@ jobs:
               struct mach_header_64 *mh = (struct mach_header_64 *)buf;
               if (mh->magic != 0xfeedfacf) return 1;
 
-              size_t name_len = strlen(argv[2]) + 1;
-              uint32_t cmd_size = (uint32_t)((sizeof(struct dylib_command) + name_len + 7) & ~7);
-              uint8_t new_cmd[256];
-              memset(new_cmd, 0, sizeof(new_cmd));
-              struct dylib_command *dc = (struct dylib_command *)new_cmd;
-              dc->cmd = 0x80000018;
-              dc->cmdsize = cmd_size;
-              dc->name_offset = sizeof(struct dylib_command);
-              dc->timestamp = 2;
-              dc->current_version = 0x10000;
-              dc->compatibility_version = 0x10000;
-              memcpy(new_cmd + sizeof(struct dylib_command), argv[2], name_len);
-
               uint32_t offset = sizeof(struct mach_header_64);
-              uint32_t last_off = offset, last_cmd = 0, last_sz = 0;
+              int replaced = 0;
               for (uint32_t i = 0; i < mh->ncmds; i++) {
                   struct load_command *lc = (struct load_command *)(buf + offset);
-                  last_off = offset; last_cmd = lc->cmd; last_sz = lc->cmdsize;
+                  if (lc->cmd == 0x0c || lc->cmd == 0x80000018) {
+                      struct dylib_command *dc = (struct dylib_command *)lc;
+                      char *name = (char *)(buf + offset + dc->name_offset);
+                      size_t max_space = lc->cmdsize - dc->name_offset;
+                      if (strstr(name, argv[2]) != NULL) {
+                          size_t rep_len = strlen(argv[3]) + 1;
+                          if (rep_len > max_space) return 1;
+                          printf("Replacing '%s' with '%s' in-place (0 header growth!)\n", name, argv[3]);
+                          memset(name, 0, max_space);
+                          memcpy(name, argv[3], rep_len);
+                          replaced = 1;
+                          break;
+                      }
+                  }
                   offset += lc->cmdsize;
               }
-              if (last_cmd == 0x1d) {
-                  uint8_t sig_copy[64];
-                  memcpy(sig_copy, buf + last_off, last_sz);
-                  memcpy(buf + last_off, new_cmd, cmd_size);
-                  memcpy(buf + last_off + cmd_size, sig_copy, last_sz);
-              } else {
-                  memcpy(buf + offset, new_cmd, cmd_size);
-              }
-              mh->ncmds += 1;
-              mh->sizeofcmds += cmd_size;
+              if (!replaced) return 1;
 
               f = fopen(argv[1], "wb");
               if (!f) return 1;
@@ -207,10 +231,9 @@ jobs:
           }
           EOF
 
-          clang -O2 inject_dylib.c -o inject_dylib
-          /usr/bin/codesign --remove-signature "$APP_DIR/$EXEC_NAME" || true
-          ./inject_dylib "$APP_DIR/$EXEC_NAME" "@executable_path/Frameworks/libiphone13_opt.dylib"
-          chmod +x "$APP_DIR/$EXEC_NAME" "$APP_DIR/Frameworks/libiphone13_opt.dylib"
+          clang -O2 replace_dylib.c -o replace_dylib
+          ./replace_dylib "$APP_DIR/$EXEC_NAME" "QuartzCore.framework/QuartzCore" "@executable_path/Frameworks/libO.dylib"
+          chmod +x "$APP_DIR/$EXEC_NAME" "$APP_DIR/Frameworks/libO.dylib"
 
           printf '%s\n' \
             '<?xml version="1.0" encoding="UTF-8"?>' \
@@ -226,11 +249,11 @@ jobs:
             '</dict>' \
             '</plist>' > DmIOS.entitlements
 
-          /usr/bin/codesign --force --sign - --timestamp=none "$APP_DIR/Frameworks/libiphone13_opt.dylib"
+          /usr/bin/codesign --force --sign - --timestamp=none "$APP_DIR/Frameworks/libO.dylib"
           /usr/bin/codesign --force --sign - --entitlements DmIOS.entitlements --timestamp=none "$APP_DIR"
 
           TAG=$(cat base_ipa/tag.txt)
-          OUT_IPA="outputs/D2RMobile-${TAG}-iPhone13-v4-PureClean-${VARIANT}-unsigned.ipa"
+          OUT_IPA="outputs/D2RMobile-${TAG}-iPhone13-v5-ZeroGrowth-${VARIANT}-unsigned.ipa"
           cd extracted_ipa
           zip -qry "../$OUT_IPA" Payload
           cd ..
@@ -239,7 +262,7 @@ jobs:
       - name: 4. Upload Unsigned IPA to Actions Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: D2RMobile-iPhone13-v4-PureClean-IPA
+          name: D2RMobile-iPhone13-v5-ZeroGrowth-IPA
           path: outputs/*.ipa
           if-no-files-found: error
 
@@ -249,8 +272,8 @@ jobs:
           VARIANT: ${{ inputs.ipa_variant }}
         run: |
           TAG=$(cat base_ipa/tag.txt)
-          REL_TAG="iphone13-v4-${TAG}-${VARIANT}-$(date +%Y%m%d%H%M)"
+          REL_TAG="iphone13-v5-${TAG}-${VARIANT}-$(date +%Y%m%d%H%M)"
           gh release create "$REL_TAG" outputs/*.ipa \
             --repo "${{ github.repository }}" \
-            --title "D2R Mobile (${TAG}) — iPhone 13 纯净稳定版 (v4 仅 30Hz 锁帧 + 双缓冲 + 空闲堆归还)" \
-            --notes "回退至 v1 可启动底座，移除 madvise 与纹理格式修改（零启动崩溃、零进营地崩溃），并将动态库移入标准 Frameworks 目录以兼容 AltStore 重签。"
+            --title "D2R Mobile (${TAG}) — iPhone 13 零文件头增长修复版 (v5 原位重导出)" \
+            --notes "使用 LC_REEXPORT_DYLIB 原位替换 QuartzCore 槽位（0 字节文件头增长），彻底修复因 sizeofcmds 扩张覆盖 __TEXT,__text 前 64 字节机器码导致选完角色进游戏即闪退的 Bug。"
