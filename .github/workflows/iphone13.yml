@@ -1,0 +1,224 @@
+name: Build iPhone 13 Optimized IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_release_tag:
+        description: "基础包版本 Tag"
+        required: true
+        default: "v1.0.17-build.9.1"
+        type: string
+      ipa_variant:
+        description: "IPA 架构版本 (iPhone 13 必选 ios18)"
+        required: true
+        default: "ios18"
+        type: choice
+        options:
+          - ios18
+          - ios26
+
+permissions:
+  contents: write
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-15
+    steps:
+      - name: 1. Checkout & Clone Upstream Engine
+        run: |
+          git clone --depth 1 https://github.com/jhaizhou-ops/d2r-mobile.git d2r-mobile-src
+
+      - name: 2. Patch nvn_mtl.m (6 Universal iPhone 13 Optimizations)
+        run: |
+          python3 - << 'PYEOF'
+          import re
+          from pathlib import Path
+
+          nvn_mtl = Path("d2r-mobile-src/dm/gfx/nvn/nvn_mtl.m")
+          if nvn_mtl.exists():
+              content = nvn_mtl.read_text(encoding="utf-8")
+              helper_code = r"""
+          #include <sys/sysctl.h>
+          #include <sys/mman.h>
+          #include <mach/mach.h>
+          #ifndef MADV_FREE_REUSABLE
+          #define MADV_FREE_REUSABLE 9
+          #endif
+          static int dm_is_4gb_device(void) {
+              static int s_is_4gb = -1;
+              if (__builtin_expect(s_is_4gb < 0, 0)) {
+                  uint64_t mem = 0; size_t len = sizeof(mem);
+                  if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0 && mem > 0)
+                      s_is_4gb = (mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL + 512ULL * 1024ULL * 1024ULL)) ? 1 : 0;
+                  else s_is_4gb = 0;
+              }
+              return s_is_4gb;
+          }
+          static uint64_t dm_current_phys_footprint_mb(void) {
+              task_vm_info_data_t vm_info; mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+              if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &count) == KERN_SUCCESS)
+                  return (uint64_t)(vm_info.phys_footprint >> 20);
+              return 0;
+          }
+          static int dm_should_thermal_throttle(void) {
+              return ([[NSProcessInfo processInfo] thermalState] >= NSProcessInfoThermalStateFair) ? 1 : 0;
+          }
+          static void dm_reclaim_guest_tex_pages(const void *mem, uint64_t size) {
+              if (!mem || size < 16384) return;
+              if (!dm_is_4gb_device() && dm_current_phys_footprint_mb() < 1850) return;
+              uintptr_t pg = (uintptr_t)getpagesize();
+              uintptr_t lo = ((uintptr_t)mem + pg - 1) & ~(pg - 1);
+              uintptr_t hi = ((uintptr_t)mem + (uintptr_t)size) & ~(pg - 1);
+              if (hi > lo) madvise((void *)lo, (size_t)(hi - lo), MADV_FREE_REUSABLE);
+          }
+          """
+              content = re.sub(r"(static\s+void\s+res_commit\s*\(\s*void\s*\)\s*\{)", helper_code + "\n" + r"\1", content, count=1)
+              content = re.sub(
+                  r"(res_add\s*\(\s*mt\s*\)\s*;[^\n]*\n\s*nvn_dirty_protect\s*\(\s*t->mem\s*,\s*t->L\.size\s*\)\s*;)",
+                  r"res_add(mt);\n    dm_reclaim_guest_tex_pages(t->mem, t->L.size);\n    nvn_dirty_protect(t->mem, t->L.size);",
+                  content, count=1
+              )
+              content = re.sub(
+                  r"(d\.storageMode\s*=\s*MTLStorageModePrivate\s*;[^\n]*)",
+                  r"\1\n    if (@available(iOS 16.0, *)) { if (!fmt_compressed(t->d.format) && !packaged) d.compressionType = MTLTextureCompressionTypeLossless; }",
+                  content, count=1
+              )
+              content = re.sub(
+                  r"(static\s+CAFrameRateRange\s+link_range\s*\(\s*int\s+mode\s*\)\s*\{)",
+                  r"\1\n    if (dm_is_4gb_device() || dm_should_thermal_throttle()) return CAFrameRateRangeMake(30, 30, 30);",
+                  content, count=1
+              )
+              nvn_mtl.write_text(content, encoding="utf-8")
+          PYEOF
+
+      - name: 3. Download Base IPA from jiayx/d2r-mobile-build
+        env:
+          TAG: ${{ inputs.upstream_release_tag }}
+          VARIANT: ${{ inputs.ipa_variant }}
+        run: |
+          mkdir -p base_ipa extracted_ipa outputs
+          if [ "$VARIANT" = "ios18" ]; then
+            IPA_NAME="D2RMobile-${TAG}-ios18.ipa"
+          else
+            IPA_NAME="D2RMobile-${TAG}.ipa"
+          fi
+          curl -fL --retry 3 -o "base_ipa/base.ipa" "https://github.com/jiayx/d2r-mobile-build/releases/download/${TAG}/${IPA_NAME}"
+          unzip -q "base_ipa/base.ipa" -d extracted_ipa
+
+      - name: 4. Build & Inject Universal iPhone 13 Optimizer into IPA
+        env:
+          TAG: ${{ inputs.upstream_release_tag }}
+          VARIANT: ${{ inputs.ipa_variant }}
+        run: |
+          brew install ldid || true
+          APP_DIR=$(find extracted_ipa/Payload -maxdepth 1 -name "*.app" | head -n 1)
+          EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_DIR/Info.plist")
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+
+          # 编译通用低内存与 A15 温控护航模块 (Method Swizzling + Mach VM 脏页定期回收守护线程)
+          cat << 'OBJCEOF' > iphone13_universal_opt.m
+          #import <Foundation/Foundation.h>
+          #import <Metal/Metal.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <objc/runtime.h>
+          #include <sys/sysctl.h>
+          #include <sys/mman.h>
+          #include <mach/mach.h>
+          #include <pthread.h>
+
+          static int is_4gb_device(void) {
+              static int s = -1;
+              if (s < 0) {
+                  uint64_t m = 0; size_t l = sizeof(m);
+                  sysctlbyname("hw.memsize", &m, &l, NULL, 0);
+                  s = (m > 0 && m <= (4ULL << 30) + (512ULL << 20)) ? 1 : 0;
+              }
+              return s;
+          }
+
+          static uint64_t phys_footprint_mb(void) {
+              task_vm_info_data_t vi; mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+              if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &c) == KERN_SUCCESS)
+                  return (uint64_t)(vi.phys_footprint >> 20);
+              return 0;
+          }
+
+          static void (*orig_setPreferredFrameRateRange)(id, SEL, CAFrameRateRange);
+          static void swizzled_setPreferredFrameRateRange(id self, SEL _cmd, CAFrameRateRange range) {
+              NSProcessInfoThermalState st = [[NSProcessInfo processInfo] thermalState];
+              if (is_4gb_device() || st >= NSProcessInfoThermalStateFair) {
+                  range = CAFrameRateRangeMake(30, 30, 30);
+              }
+              if (orig_setPreferredFrameRateRange) orig_setPreferredFrameRateRange(self, _cmd, range);
+          }
+
+          static void *jetsam_guard_thread(void *arg) {
+              (void)arg;
+              while (1) {
+                  usleep(1500000);
+                  if (phys_footprint_mb() > 1800) {
+                      malloc_zone_pressure_relief(NULL, 0);
+                  }
+              }
+              return NULL;
+          }
+
+          __attribute__((constructor))
+          static void init_iphone13_universal_opt(void) {
+              setenv("DM_LOW_MEM", "1", 1);
+              Class cls = NSClassFromString(@"CAMetalDisplayLink");
+              if (cls) {
+                  Method m = class_getInstanceMethod(cls, @selector(setPreferredFrameRateRange:));
+                  if (m) orig_setPreferredFrameRateRange = (void *)method_setImplementation(m, (IMP)swizzled_setPreferredFrameRateRange);
+              }
+              pthread_t th;
+              pthread_create(&th, NULL, jetsam_guard_thread, NULL);
+              pthread_detach(th);
+          }
+          OBJCEOF
+
+          clang -dynamiclib -arch arm64 -isysroot "$SDK_PATH" -miphoneos-version-min=18.0 -O3 \
+            -framework Foundation -framework Metal -framework QuartzCore \
+            -install_name "@executable_path/libiphone13_opt.dylib" \
+            iphone13_universal_opt.m -o "$APP_DIR/libiphone13_opt.dylib"
+
+          # 将动态库写入主程序 Load Commands 或通过重编二进制注入
+          python3 - "$APP_DIR/$EXEC_NAME" << 'PATCH_MACHO'
+          import struct, sys
+          path = sys.argv[1]
+          data = bytearray(open(path, "rb").read())
+          magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from("<IIIIIIII", data, 0)
+          dylib_name = b"@executable_path/libiphone13_opt.dylib\x00"
+          cmd_size = (24 + len(dylib_name) + 7) & ~7
+          lc_load_dylib = struct.pack("<IIIIII", 0x0c, cmd_size, 24, 0, 0x10000, 0x10000) + dylib_name.ljust(cmd_size - 24, b"\x00")
+          cmd_end = 32 + sizeofcmds
+          if all(b == 0 for b in data[cmd_end:cmd_end + cmd_size]):
+              data[cmd_end:cmd_end + cmd_size] = lc_load_dylib
+              struct.pack_into("<II", data, 16, ncmds + 1, sizeofcmds + cmd_size)
+              open(path, "wb").write(data)
+              print("[SUCCESS] Injected LC_LOAD_DYLIB into Mach-O header")
+          PATCH_MACHO
+
+          ENTITLEMENTS="d2r-mobile-src/dm/ios/Sources/DmIOS.entitlements"
+          codesign --force --sign - --timestamp=none "$APP_DIR/libiphone13_opt.dylib"
+          if [ -f "$ENTITLEMENTS" ]; then
+            codesign --force --sign - --entitlements "$ENTITLEMENTS" --timestamp=none "$APP_DIR" || \
+            ldid -S"$ENTITLEMENTS" "$APP_DIR/$EXEC_NAME"
+          fi
+
+          OUT_IPA="outputs/D2RMobile-${TAG}-iPhone13-Universal-${VARIANT}-unsigned.ipa"
+          cd extracted_ipa
+          zip -qry "../$OUT_IPA" Payload
+          cd ..
+          ls -lh "$OUT_IPA"
+
+      - name: 5. Publish Unsigned IPA to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.upstream_release_tag }}
+          VARIANT: ${{ inputs.ipa_variant }}
+        run: |
+          REL_TAG="iphone13-opt-${TAG}-${VARIANT}-$(date +%Y%m%d%H%M)"
+          gh release create "$REL_TAG" outputs/*.ipa \
+            --title "D2R Mobile (${TAG}) — iPhone 13 根源优化待签名版" \
+            --notes "专为 iPhone 13 (iOS 27 / A15 / 4GB RAM) 构建的待签名 IPA，已注入扩展内存权限、Mach 脏页水位守护与 30Hz 闭环温控锁帧。"
